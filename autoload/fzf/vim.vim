@@ -32,13 +32,16 @@ let s:min_version = '0.23.0'
 let s:is_win = has('win32') || has('win64')
 let s:layout_keys = ['window', 'up', 'down', 'left', 'right']
 let s:bin_dir = expand('<sfile>:p:h:h:h').'/bin/'
-let s:bin = {
+let s:bin = extend({
 \ 'preview': s:bin_dir.'preview.sh',
-\ 'tags':    s:bin_dir.'tags.pl' }
+\ 'tags':    s:bin_dir.'tags.pl' }, get(g:, 'fzf_bin', {}))
 let s:TYPE = {'dict': type({}), 'funcref': type(function('call')), 'string': type(''), 'list': type([])}
-if s:is_win
-  if has('nvim')
-    let s:bin.preview = split(system('for %A in ("'.s:bin.preview.'") do @echo %~sA'), "\n")[0]
+if s:is_win && (index([[], 0], get(g:, 'fzf_preview_window')) == -1)
+  if has('nvim') && s:bin.preview =~ '/preview.sh'
+    function! s:on_stdout(job_id, data, event) dict
+      let s:bin.preview = trim(a:data[0])
+    endfunction
+    call jobwait([jobstart(['cmd', '/c', '"for %A in ("'.s:bin.preview.'") do @echo %~sA"'], {'on_stdout' : function('s:on_stdout'), 'stdout_buffered' : v:true})])
   else
     let s:bin.preview = fnamemodify(s:bin.preview, ':8')
   endif
@@ -46,7 +49,7 @@ endif
 
 let s:wide = 120
 let s:warned = 0
-let s:checked = 0
+let s:checked = get(g:, 'fzf_no_check_requirements', 0)
 
 function! s:version_requirement(val, min)
   let val = split(a:val, '\.')
@@ -127,12 +130,14 @@ function! fzf#vim#with_preview(...)
     call remove(args, 0)
   endif
 
-  if !executable('bash')
-    if !s:warned
-      call s:warn('Preview window not supported (bash not found in PATH)')
-      let s:warned = 1
+  if s:bin.preview =~ '.*\.sh$'
+    if !executable('bash')
+      if !s:warned
+        call s:warn('Preview window not supported (bash not found in PATH)')
+        let s:warned = 1
+      endif
+      return spec
     endif
-    return spec
   endif
 
   " Placeholder expression (TODO/TBD: undocumented)
@@ -162,16 +167,20 @@ function! fzf#vim#with_preview(...)
     let preview += ['--preview-window', window]
   endif
   if s:is_win
-    let is_wsl_bash = exepath('bash') =~? 'Windows[/\\]system32[/\\]bash.exe$'
-    if empty($MSWINHOME)
-      let $MSWINHOME = $HOME
+    if s:bin.preview =~ '.*\.sh$'
+      let is_wsl_bash = exepath('bash') =~? 'Windows[/\\]system32[/\\]bash.exe$'
+      if empty($MSWINHOME)
+        let $MSWINHOME = $HOME
+      endif
+      if is_wsl_bash && $WSLENV !~# '[:]\?MSWINHOME\(\/[^:]*\)\?\(:\|$\)'
+        let $WSLENV = 'MSWINHOME/u:'.$WSLENV
+      endif
+      let preview_cmd = 'bash '.(is_wsl_bash
+      \ ? substitute(substitute(s:bin.preview, '^\([A-Z]\):', '/mnt/\L\1', ''), '\', '/', 'g')
+      \ : escape(s:bin.preview, '\'))
+    else
+      let preview_cmd = escape(s:bin.preview, '\')
     endif
-    if is_wsl_bash && $WSLENV !~# '[:]\?MSWINHOME\(\/[^:]*\)\?\(:\|$\)'
-      let $WSLENV = 'MSWINHOME/u:'.$WSLENV
-    endif
-    let preview_cmd = 'bash '.(is_wsl_bash
-    \ ? substitute(substitute(s:bin.preview, '^\([A-Z]\):', '/mnt/\L\1', ''), '\', '/', 'g')
-    \ : escape(s:bin.preview, '\'))
   else
     let preview_cmd = fzf#shellescape(s:bin.preview)
   endif
@@ -924,7 +933,7 @@ function! s:tags_sink(lines)
 endfunction
 
 function! fzf#vim#tags(query, ...)
-  if !executable('perl')
+  if !executable('perl') && s:bin.tags =~ '/tags.pl'
     return s:warn('Tags command requires perl')
   endif
   if empty(tagfiles())
@@ -956,7 +965,7 @@ function! fzf#vim#tags(query, ...)
   let opts = v2_limit < 0 ? ['--algo=v1'] : []
 
   return s:fzf('tags', {
-  \ 'source':  'perl '.fzf#shellescape(s:bin.tags).' '.join(map(tagfiles, 'fzf#shellescape(fnamemodify(v:val, ":p"))')),
+  \ 'source':  (s:bin.tags =~ '/tags.pl' ? 'perl' : s:bin.tags).' '.fzf#shellescape(s:bin.tags).' '.join(map(tagfiles, 'fzf#shellescape(fnamemodify(v:val, ":p"))')),
   \ 'sink*':   s:function('s:tags_sink'),
   \ 'options': extend(opts, ['--nth', '1..2', '-m', '-d', '\t', '--tiebreak=begin', '--prompt', 'Tags> ', '--query', a:query])}, a:000)
 endfunction
@@ -1095,7 +1104,7 @@ function! s:helptag_sink(line)
 endfunction
 
 function! fzf#vim#helptags(...)
-  if !executable('grep') || !executable('perl')
+  if !executable('grep') || (!executable('perl') && s:bin.tags =~ '/tags.pl')
     return s:warn('Helptags command requires grep and perl')
   endif
   let sorted = sort(split(globpath(&runtimepath, 'doc/tags', 1), '\n'))
@@ -1108,7 +1117,7 @@ function! fzf#vim#helptags(...)
   call writefile(['/('.(s:is_win ? '^[A-Z]:[\/\\].*?[^:]' : '.*?').'):(.*?)\t(.*?)\t/; printf(qq('.s:green('%-40s', 'Label').'\t%s\t%s\n), $2, $3, $1)'], s:helptags_script)
   return s:fzf('helptags', {
   \ 'source':  'grep -H ".*" '.join(map(tags, 'fzf#shellescape(v:val)')).
-    \ ' | perl -n '.fzf#shellescape(s:helptags_script).' | sort',
+    \ ' | '.(s:bin.tags =~ '/tags.pl' ? 'perl -n' : s:bin.tags).' '.fzf#shellescape(s:helptags_script).' | sort',
   \ 'sink':    s:function('s:helptag_sink'),
   \ 'options': ['--ansi', '+m', '--tiebreak=begin', '--with-nth', '..-2']}, a:000)
 endfunction
